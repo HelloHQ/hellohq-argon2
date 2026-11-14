@@ -15,7 +15,7 @@ Kit verifier uses it, and the app's tests compare this library against it.
 
 ```c
 uint32_t    hqargon2_abi_version(void);   // 1
-const char *hqargon2_backend_id(void);    // "hellohq-argon2 0.1.0 (argon2 0.6.0 parallel)"
+const char *hqargon2_backend_id(void);    // "hellohq-argon2 0.1.1 (argon2 0.6.0 parallel)"
 int32_t     hqargon2id_derive(const uint8_t *pwd, size_t pwd_len,
                               const uint8_t *salt, size_t salt_len,
                               uint32_t m_cost_kib, uint32_t t_cost, uint32_t p_cost,
