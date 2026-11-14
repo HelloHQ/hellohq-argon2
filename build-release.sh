@@ -69,12 +69,24 @@ build_android() {
               x86:i686-linux-android:i686-linux-android; do
     IFS=: read -r abi triple clang <<<"$pair"
     local up; up="$(echo "$triple" | tr 'a-z-' 'A-Z_')"
+    # 16 KB pages: Android 15+ devices with 16 KB pages refuse a library whose
+    # LOAD segments are only 4 KB-aligned, and Google Play requires 16 KB
+    # support for apps targeting SDK 35+. NDK r28 aligns by default; the pinned
+    # r27d does not, so ask the linker explicitly (harmless on 4 KB devices).
     env "CARGO_TARGET_${up}_LINKER=$bin/${clang}${ANDROID_API}-clang" \
         "CC_${triple//-/_}=$bin/${clang}${ANDROID_API}-clang" \
         "AR_${triple//-/_}=$bin/llvm-ar" \
+        "RUSTFLAGS=$RUSTFLAGS -C link-arg=-Wl,-z,max-page-size=16384" \
       cargo build --release --locked --target "$triple"
     mkdir -p "$STAGE/jniLibs/$abi"
     cp "target/$triple/release/libhellohq_argon2.so" "$STAGE/jniLibs/$abi/"
+    # Fail closed: every LOAD segment of every ABI must be aligned to >= 16 KB.
+    local aligns bad
+    aligns="$("$bin/llvm-readelf" -lW "$STAGE/jniLibs/$abi/libhellohq_argon2.so" | awk '$1 == "LOAD" {print $NF}')"
+    [ -n "$aligns" ] || { echo "::error::$abi: no LOAD segments read"; exit 1; }
+    bad="$(echo "$aligns" | while read -r a; do [ $((a)) -ge 16384 ] || echo "$a"; done)"
+    [ -z "$bad" ] || { echo "::error::$abi libhellohq_argon2.so has LOAD segments aligned to $bad (< 16 KB)"; exit 1; }
+    echo "ok 16 KB-aligned LOAD segments: $abi"
   done
   find "$STAGE/jniLibs" -exec touch -t 200001010000 {} +
   ( cd "$STAGE" && find jniLibs | LC_ALL=C sort | zip -qX -@ jniLibs.zip && rm -rf jniLibs )

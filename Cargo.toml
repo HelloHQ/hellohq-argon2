@@ -1,6 +1,6 @@
 [package]
 name = "hellohq-argon2"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 rust-version = "1.85"
 description = "Argon2id (RFC 9106, v0x13) over a small explicit C ABI - a zeroizing, panic-safe FFI wrapper around RustCrypto argon2 for HelloHQ."

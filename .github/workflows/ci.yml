@@ -25,7 +25,7 @@ jobs:
         runner: [ubuntu-24.04, ubuntu-24.04-arm, macos-26, macos-15-intel, windows-2025]
     runs-on: ${{ matrix.runner }}
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - uses: ./.github/actions/pinned-rust
@@ -35,7 +35,7 @@ jobs:
     name: fmt + clippy
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - uses: ./.github/actions/pinned-rust
@@ -52,7 +52,7 @@ jobs:
     name: cargo-deny
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - uses: ./.github/actions/pinned-rust
@@ -80,7 +80,7 @@ jobs:
     name: Pinned Xcode is on the macOS image
     runs-on: macos-26
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - name: Read the pins from _build.yml
@@ -116,7 +116,7 @@ jobs:
           - { runner: ubuntu-24.04, target: i686-linux-android }
           - { runner: windows-2025, target: aarch64-pc-windows-msvc }
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - uses: ./.github/actions/pinned-rust
@@ -133,7 +133,7 @@ jobs:
         runner: [windows-2025, macos-26, ubuntu-24.04]
     runs-on: ${{ matrix.runner }}
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - uses: ./.github/actions/pinned-rust
@@ -147,3 +147,26 @@ jobs:
           bash build-release.sh "$RUNNER_TEMP/b"
           cat "$RUNNER_TEMP/a/SHA256SUMS" "$RUNNER_TEMP/b/SHA256SUMS"
           diff "$RUNNER_TEMP/a/SHA256SUMS" "$RUNNER_TEMP/b/SHA256SUMS"
+
+  # The release's Android build with the pinned NDK, on every push: its
+  # build-release.sh step refuses any ABI whose LOAD segments are under 16 KB
+  # (Android 15+ 16 KB-page devices; Google Play), so a regression is caught
+  # here rather than by a release.
+  android:
+    name: Android build (pinned NDK, 16 KB pages)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/pinned-rust
+      - name: Pinned NDK from _build.yml
+        shell: bash
+        run: |
+          set -euo pipefail
+          v="$(sed -nE 's/^  ANDROID_NDK_VERSION: "([^"]+)".*/\1/p' .github/workflows/_build.yml)"
+          ndk="${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}/ndk/$v"
+          [ -d "$ndk" ] || { echo "::error::NDK $v not on this image (have: $(ls "$(dirname "$ndk")" | tr '\n' ' '))"; exit 1; }
+          echo "ANDROID_NDK_HOME=$ndk" >> "$GITHUB_ENV"
+      - name: Build (fails on any LOAD segment under 16 KB)
+        run: bash build-release.sh "$RUNNER_TEMP/dist"
