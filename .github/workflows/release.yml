@@ -1,0 +1,95 @@
+name: Release
+
+# Cross-builds the Argon2id native libs and publishes a GitHub Release with a
+# SHA256SUMS manifest and per-asset build-provenance attestation. Consumers
+# (hellohq's scripts/fetch-argon2-libs.sh) refuse any asset whose SHA-256 does
+# not match the digest pinned in hellohq's native/argon2/artifacts.lock, and
+# whose attestation does not verify against this workflow
+# (ATTESTATION=github in that lock). Trigger: push tag vX.Y.Z.
+#
+# REPRODUCIBILITY: rustc is pinned by rust-toolchain.toml, the macOS/iOS SDK,
+# Android NDK and runner images by _build.yml; each pin fails the build rather
+# than drifting. reproduce.yml rebuilds a published tag on the same matrix and
+# compares every digest with its SHA256SUMS.
+#
+# Asset names (must match hellohq native/argon2/artifacts.lock):
+#   libhellohq_argon2.dylib                macOS universal (arm64 + x86_64)
+#   HellohqArgon2.xcframework.zip          iOS device + simulator (dynamic)
+#   jniLibs.zip                            Android arm64-v8a armeabi-v7a x86_64 x86
+#   libhellohq_argon2-linux-x64.so         Linux x86_64
+#   hellohq_argon2-windows-x64.dll         Windows x86_64
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag (e.g. v0.1.0)
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    # Never release a build that fails its own conformance vectors.
+    name: Conformance gate
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/pinned-rust
+      - run: cargo test --locked --release --all-targets
+
+  # The matrix lives in _build.yml so reproduce.yml rebuilds with exactly the
+  # same runners, pinned rustc (rust-toolchain.toml), pinned SDK and NDK.
+  build:
+    needs: verify
+    uses: ./.github/workflows/_build.yml
+    with:
+      source-ref: ${{ github.sha }}
+      pins-ref: ${{ github.sha }}
+
+  release:
+    name: Publish + attest
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write # create the release
+      id-token: write # provenance signing
+      attestations: write # attest-build-provenance
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          path: in
+          pattern: dist-*
+          merge-multiple: true
+
+      - name: Stage assets (drop per-job SHA256SUMS, recompute combined)
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p assets
+          find in -type f ! -name SHA256SUMS -exec cp {} assets/ \;
+          cd assets
+          # Fail closed if any shipped platform is missing.
+          for f in libhellohq_argon2.dylib HellohqArgon2.xcframework.zip jniLibs.zip \
+                   libhellohq_argon2-linux-x64.so \
+                   hellohq_argon2-windows-x64.dll; do
+            [ -f "$f" ] || { echo "::error::missing release asset $f"; exit 1; }
+          done
+          sha256sum * | tee SHA256SUMS
+
+      - uses: actions/attest-build-provenance@v4
+        with:
+          subject-path: assets/*
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.event.inputs.tag || github.ref_name }}
+        run: |
+          gh release create "$TAG" assets/* --repo "$GITHUB_REPOSITORY" \
+            --title "$TAG" --generate-notes --verify-tag

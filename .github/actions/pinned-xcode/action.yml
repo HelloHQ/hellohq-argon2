@@ -1,0 +1,60 @@
+name: Pinned Xcode
+description: >-
+  Selects exactly the pinned Xcode and asserts it carries the pinned macOS and
+  iOS SDKs; fails if the runner image lacks it. Both are pinned because both
+  change the bytes: the SDK version is recorded in every Mach-O
+  (LC_BUILD_VERSION / LC_VERSION_MIN_IPHONEOS `sdk`), and an image can carry
+  several Xcodes with the same SDK (macos-26 has 26.5 and 26.6, both SDK 26.5)
+  whose linkers need not agree. 26.6 is the image default
+  (actions/runner-images#14344), which v0.1.0 used without selecting one, and
+  rebuilding v0.1.0 with it reproduces the Apple assets byte for byte.
+
+inputs:
+  xcode:
+    description: Xcode version, i.e. /Applications/Xcode_<xcode>.app.
+    required: true
+  macos-sdk:
+    description: Required `xcrun --sdk macosx --show-sdk-version`.
+    required: true
+  ios-sdk:
+    description: Required `xcrun --sdk iphoneos --show-sdk-version`.
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - name: Select the pinned Xcode and check its SDKs
+      shell: bash
+      env:
+        WANT_XCODE: ${{ inputs.xcode }}
+        WANT_MACOS: ${{ inputs.macos-sdk }}
+        WANT_IOS: ${{ inputs.ios-sdk }}
+      run: |
+        set -euo pipefail
+        # GitHub's images name each Xcode /Applications/Xcode_<version>.app; the
+        # self-hosted Mac has plain Xcode.app and the like. Pick the app by its
+        # CFBundleShortVersionString, whatever it is called.
+        app="" have=""
+        for candidate in /Applications/Xcode_"${WANT_XCODE}".app /Applications/Xcode*.app; do
+          [ -d "$candidate/Contents/Developer" ] || continue
+          version="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$candidate/Contents/Info.plist" 2>/dev/null || echo '?')"
+          have="${have} $(basename "$candidate")=${version}"
+          if [ -z "$app" ] && [ "$version" = "$WANT_XCODE" ]; then app="$candidate"; fi
+        done
+        if [ -z "$app" ]; then
+          echo "::error::no Xcode $WANT_XCODE on this runner (have:${have:- none}). Move the pin deliberately: a different Xcode changes the shipped bytes (new release + re-pin the consumer's digests)."
+          exit 1
+        fi
+        # Job-scoped via DEVELOPER_DIR, not `sudo xcode-select -s`: the macOS
+        # runner is persistent and that would change the host's Xcode.
+        export DEVELOPER_DIR="$app/Contents/Developer"
+        echo "DEVELOPER_DIR=$DEVELOPER_DIR" >> "$GITHUB_ENV"
+        mac="$(xcrun --sdk macosx --show-sdk-version)"
+        ios="$(xcrun --sdk iphoneos --show-sdk-version)"
+        xcodebuild -version
+        echo "macOS SDK $mac, iOS SDK $ios"
+        if [ "$mac" != "$WANT_MACOS" ] || [ "$ios" != "$WANT_IOS" ]; then
+          echo "::error::$app has macOS SDK $mac / iOS SDK $ios, pinned $WANT_MACOS / $WANT_IOS"
+          exit 1
+        fi
+        echo "- \`$(xcodebuild -version | tr '\n' ' ')\` macOS SDK $mac, iOS SDK $ios" >> "$GITHUB_STEP_SUMMARY"

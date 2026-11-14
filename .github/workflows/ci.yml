@@ -1,0 +1,149 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+# PUBLIC REPOSITORY: GitHub-hosted runners only (see _build.yml).
+#
+# Every job compiles with the rustc pinned in rust-toolchain.toml (components
+# and every shipped target included), via .github/actions/pinned-rust, so CI
+# tests the compiler the next release will use.
+
+jobs:
+  test:
+    name: Test · ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # Every OS/arch with a hosted runner: the RFC 9106 and EK-002 vectors
+        # and the differential cases run natively on each.
+        runner: [ubuntu-24.04, ubuntu-24.04-arm, macos-26, macos-15-intel, windows-2025]
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/pinned-rust
+      - run: cargo test --locked --release --all-targets
+
+  lint:
+    name: fmt + clippy
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/pinned-rust
+      - run: cargo fmt --all --check
+      - run: cargo clippy --locked --all-targets -- -D warnings
+      - name: Every target build-release.sh builds is pinned in rust-toolchain.toml
+        run: |
+          set -euo pipefail
+          for t in $(grep -oE '\b(aarch64|x86_64|armv7|i686)-[a-z0-9_]+(-[a-z0-9_]+)*' build-release.sh | sort -u); do
+            grep -q "\"$t\"" rust-toolchain.toml || { echo "::error::build-release.sh builds $t but rust-toolchain.toml does not list it"; exit 1; }
+          done
+
+  deny:
+    name: cargo-deny
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/pinned-rust
+      - name: Install cargo-deny 0.20.2 (SHA-256 pinned)
+        shell: bash
+        env:
+          VERSION: "0.20.2"
+          SHA256: 9f12ed4c49936e09b48bf862b595cde2fe64fcbd9d74dfacac6131ca824c8d5f
+        run: |
+          set -euo pipefail
+          name="cargo-deny-${VERSION}-x86_64-unknown-linux-musl"
+          curl --proto '=https' --tlsv1.2 -sSfL --retry 5 --retry-all-errors \
+            -o "$RUNNER_TEMP/$name.tar.gz" \
+            "https://github.com/EmbarkStudios/cargo-deny/releases/download/${VERSION}/$name.tar.gz"
+          echo "$SHA256  $RUNNER_TEMP/$name.tar.gz" | sha256sum -c -
+          tar -xzf "$RUNNER_TEMP/$name.tar.gz" -C "$RUNNER_TEMP"
+          echo "$RUNNER_TEMP/$name" >> "$GITHUB_PATH"
+      - name: cargo deny check
+        run: cargo deny --locked check
+
+  # The release builds the Apple assets with the Xcode and SDKs _build.yml
+  # pins. Check on every push that the image still has them, so a release
+  # does not find out after the conformance gate.
+  pinned-xcode:
+    name: Pinned Xcode is on the macOS image
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Read the pins from _build.yml
+        id: pins
+        shell: bash
+        run: |
+          set -euo pipefail
+          for k in XCODE MACOS_SDK IOS_SDK; do
+            v="$(sed -nE "s/^  ${k}: \"([^\"]+)\".*/\\1/p" .github/workflows/_build.yml)"
+            [ -n "$v" ] || { echo "::error::_build.yml has no ${k} pin"; exit 1; }
+            echo "$(echo "$k" | tr 'A-Z_' 'a-z-')=$v" >> "$GITHUB_OUTPUT"
+          done
+      - uses: ./.github/actions/pinned-xcode
+        with:
+          xcode: ${{ steps.pins.outputs.xcode }}
+          macos-sdk: ${{ steps.pins.outputs.macos-sdk }}
+          ios-sdk: ${{ steps.pins.outputs.ios-sdk }}
+
+  # Type-check every shipped target even where no runner executes it.
+  cross-check:
+    name: Cross-check · ${{ matrix.target }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { runner: macos-26, target: aarch64-apple-ios }
+          - { runner: macos-26, target: aarch64-apple-ios-sim }
+          - { runner: macos-26, target: x86_64-apple-ios }
+          - { runner: ubuntu-24.04, target: aarch64-linux-android }
+          - { runner: ubuntu-24.04, target: armv7-linux-androideabi }
+          - { runner: ubuntu-24.04, target: x86_64-linux-android }
+          - { runner: ubuntu-24.04, target: i686-linux-android }
+          - { runner: windows-2025, target: aarch64-pc-windows-msvc }
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/pinned-rust
+      - run: cargo check --locked --release --target ${{ matrix.target }}
+
+  # Two clean release builds on one runner must be byte-identical (MSVC
+  # timestamps and xcframework slice order are the known traps; build-release.sh
+  # handles both).
+  deterministic:
+    name: Release build is deterministic · ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [windows-2025, macos-26, ubuntu-24.04]
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/pinned-rust
+      - name: Two clean release builds, compare digests
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash build-release.sh "$RUNNER_TEMP/a"
+          cargo clean
+          sleep 5
+          bash build-release.sh "$RUNNER_TEMP/b"
+          cat "$RUNNER_TEMP/a/SHA256SUMS" "$RUNNER_TEMP/b/SHA256SUMS"
+          diff "$RUNNER_TEMP/a/SHA256SUMS" "$RUNNER_TEMP/b/SHA256SUMS"

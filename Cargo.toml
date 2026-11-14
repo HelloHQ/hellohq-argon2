@@ -1,0 +1,43 @@
+[package]
+name = "hellohq-argon2"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+description = "Argon2id (RFC 9106, v0x13) over a small explicit C ABI - a zeroizing, panic-safe FFI wrapper around RustCrypto argon2 for HelloHQ."
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/HelloHQ/hellohq-argon2"
+keywords = ["argon2", "argon2id", "kdf", "password-hashing", "ffi"]
+categories = ["cryptography", "api-bindings"]
+publish = false
+
+[lib]
+name = "hellohq_argon2"
+# staticlib -> static linking; cdylib -> the shared library every app platform
+# loads; rlib -> tests.
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[dependencies]
+# RustCrypto argon2. 0.6.0 is the first release with lane parallelism
+# (`parallel` = rayon). Defaults OFF: no password-hash / PHC strings, no
+# getrandom, no allocation inside the crate (the block matrix is ours).
+argon2 = { version = "=0.6.0", default-features = false, features = ["parallel", "zeroize"] }
+# Anonymous mapping for the block matrix: its pages go back to the OS as soon
+# as a derivation returns (malloc's large-allocation cache kept them resident).
+memmap2 = "=0.9.12"
+# Wipe the block matrix and every error-path output.
+zeroize = "1"
+
+[dev-dependencies]
+hex = "0.4"
+# Independent pure-Rust Argon2 implementation, used ONLY for differential tests
+# (never linked into the library).
+ref_argon2 = { package = "rust-argon2", version = "=3.0.0" }
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true
+# panic = unwind (default) so catch_unwind at the FFI boundary converts a panic
+# into an error code instead of aborting or unwinding across the C ABI.
+panic = "unwind"

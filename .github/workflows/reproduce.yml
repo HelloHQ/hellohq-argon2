@@ -1,0 +1,95 @@
+name: Reproduce release
+
+# Rebuilds a PUBLISHED tag on the release matrix (_build.yml: same runner
+# labels, rustc from rust-toolchain.toml, pinned SDK/NDK) and compares every
+# asset's SHA-256 with that release's SHA256SUMS. Publishes nothing.
+#
+# This is how to answer "would the current pins change the shipped bytes?"
+# without cutting a release: run it against the latest tag after any pin change.
+# A tag older than a pin change is built from its own source with the pins
+# overlaid from the ref this workflow runs on.
+#
+# A mismatch is reported per asset and fails the run. It is evidence, not
+# proof of tampering: the host toolchain behind each label is not pinned
+# (see _build.yml), so a mismatch can also mean the host's linker moved. Read README "Reproducibility" before acting on one.
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Published release tag to rebuild (e.g. v0.1.0)
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    uses: ./.github/workflows/_build.yml
+    with:
+      source-ref: ${{ inputs.tag }}
+      pins-ref: ${{ github.sha }}
+
+  compare:
+    name: Compare with the published SHA256SUMS
+    needs: build
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          path: in
+          pattern: dist-*
+          merge-multiple: true
+
+      - name: Download the release's SHA256SUMS
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release download "${{ inputs.tag }}" --repo "$GITHUB_REPOSITORY" --pattern SHA256SUMS --dir published
+
+      - name: Compare digests
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          rm -f in/SHA256SUMS
+          mismatch=0
+          {
+            echo "### Reproduce ${{ inputs.tag }} (pins from \`${GITHUB_SHA::12}\`)"
+            echo
+            echo "| asset | published | rebuilt | |"
+            echo "|---|---|---|---|"
+          } >> "$GITHUB_STEP_SUMMARY"
+          while read -r want name; do
+            if [ -f "in/$name" ]; then
+              got="$(sha256sum "in/$name" | cut -d' ' -f1)"
+            else
+              got="(not built)"
+            fi
+            if [ "$got" = "$want" ]; then mark="identical"; else mark="DIFFERS"; mismatch=1; fi
+            echo "$mark  $name"
+            echo "| \`$name\` | \`${want::16}\` | \`${got::16}\` | $mark |" >> "$GITHUB_STEP_SUMMARY"
+          done < published/SHA256SUMS
+          # For a differing zip, show WHICH entry differs: download the
+          # published asset and compare per-file digests and entry headers.
+          while read -r want name; do
+            case "$name" in *.zip) ;; *) continue ;; esac
+            [ -f "in/$name" ] || continue
+            [ "$(sha256sum "in/$name" | cut -d' ' -f1)" = "$want" ] && continue
+            echo "::group::why $name differs"
+            gh release download "${{ inputs.tag }}" --repo "$GITHUB_REPOSITORY" --pattern "$name" --dir pub-zip --clobber
+            rm -rf zp zr && mkdir zp zr
+            unzip -q "pub-zip/$name" -d zp && unzip -q "in/$name" -d zr
+            ( cd zp && find . -type f -print0 | sort -z | xargs -0 sha256sum ) > zp.sums
+            ( cd zr && find . -type f -print0 | sort -z | xargs -0 sha256sum ) > zr.sums
+            diff zp.sums zr.sums || true
+            diff <(zipinfo -v "pub-zip/$name") <(zipinfo -v "in/$name") | head -80 || true
+            for f in $(diff zp.sums zr.sums | sed -nE 's/^[<>] [0-9a-f]+  (.*)/\1/p' | sort -u); do
+              case "$f" in *.plist) echo "--- $f"; diff "zp/$f" "zr/$f" || true ;; esac
+            done
+            echo "::endgroup::"
+          done < published/SHA256SUMS
+          if [ "$mismatch" -ne 0 ]; then
+            echo "::error::rebuild of ${{ inputs.tag }} is not byte-identical for at least one asset (see summary)"
+            exit 1
+          fi

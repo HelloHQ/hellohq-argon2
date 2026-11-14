@@ -1,0 +1,85 @@
+name: Pinned Rust toolchain
+description: >-
+  Installs exactly the toolchain rust-toolchain.toml pins (channel, components,
+  targets) and fails if any other rustc is active. Replaces
+  dtolnay/rust-toolchain@stable, which installed whatever `stable` was that day.
+
+runs:
+  using: composite
+  steps:
+    # The self-hosted Linux runners do not all have rustup on PATH (runner-2
+    # and runner-5 failed with "rustup: command not found", 2026-10-28). Install
+    # it into the runner tool cache rather than a user's home. The runners on
+    # one VM share that cache, so the install holds a lock and is done once.
+    # A runner that already has rustup keeps using it. hq-windows-runner-1 has
+    # none either, so Windows gets rustup-init.exe the same way.
+    - name: Make rustup available
+      shell: bash
+      run: |
+        set -euo pipefail
+        command -v rustup >/dev/null 2>&1 && { rustup -V; exit 0; }
+        # On Windows (Git Bash) the env and PATH entries are Windows paths and
+        # the installer is rustup-init.exe; bash works on the POSIX form.
+        if [ "$RUNNER_OS" = Windows ]; then
+          base_native="${RUNNER_TOOL_CACHE:?}\\hq-rustup"
+          base="$(cygpath -u "$base_native")"
+          sep='\'; exe=.exe
+        else
+          base="${RUNNER_TOOL_CACHE:?}/hq-rustup"
+          base_native="$base"
+          sep=/; exe=
+        fi
+        export CARGO_HOME="${base_native}${sep}cargo" RUSTUP_HOME="${base_native}${sep}rustup"
+        mkdir -p "$base"
+        (
+          # mkdir is atomic: the first runner installs, the others wait for it.
+          # A lock older than 10 minutes is a killed job's: take it over.
+          waited=0
+          until mkdir "$base/.installing" 2>/dev/null; do
+            [ "$waited" -lt 600 ] || { rmdir "$base/.installing" 2>/dev/null || true; waited=0; continue; }
+            sleep 5; waited=$((waited + 5))
+          done
+          trap 'rmdir "$base/.installing"' EXIT
+          if [ ! -x "$base/cargo/bin/rustup$exe" ]; then
+            if [ "$RUNNER_OS" = Windows ]; then
+              # A Windows path for -o: the runner's curl may be Windows' own
+              # curl.exe, which cannot write to a Git Bash /c/... path
+              # ("curl: (23) client returned ERROR on write", 2026-10-28).
+              curl --proto '=https' --tlsv1.2 -sSfL -o "$(cygpath -w "$base/rustup-init.exe")" \
+                https://static.rust-lang.org/rustup/dist/x86_64-pc-windows-msvc/rustup-init.exe
+              "$base/rustup-init.exe" -y --no-modify-path --profile minimal --default-toolchain none
+            else
+              curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+                | sh -s -- -y --no-modify-path --profile minimal --default-toolchain none
+            fi
+          fi
+        )
+        { echo "CARGO_HOME=$CARGO_HOME"; echo "RUSTUP_HOME=$RUSTUP_HOME"; } >> "$GITHUB_ENV"
+        echo "${CARGO_HOME}${sep}bin" >> "$GITHUB_PATH"
+        "$base/cargo/bin/rustup$exe" -V
+
+    - name: Install and verify the pinned toolchain
+      shell: bash
+      run: |
+        set -euo pipefail
+        want="$(sed -nE 's/^channel *= *"([^"]+)".*/\1/p' rust-toolchain.toml)"
+        [ -n "$want" ] || { echo "::error::rust-toolchain.toml has no channel"; exit 1; }
+        # Install the channel with the file's components and targets named
+        # explicitly. A bare `rustup toolchain install` reads them itself only
+        # on rustup >= 1.28, and hq-macos-runner-1 has an older one.
+        list() { # list <key>: the quoted strings of rust-toolchain.toml's <key> array
+          awk -v k="$1" '$0 ~ "^"k" *=" {f=1} f {print} f && /\]/ {exit}' rust-toolchain.toml \
+            | sed 's/#.*//' | grep -oE '"[^"]+"' | tr -d '"'
+        }
+        args=()
+        for c in $(list components); do args+=(--component "$c"); done
+        for t in $(list targets); do args+=(--target "$t"); done
+        rustup toolchain install "$want" --profile minimal --no-self-update "${args[@]}"
+        got="$(rustc -V)"
+        rustc -Vv
+        cargo -V
+        case "$got" in
+          "rustc $want "*) ;;
+          *) echo "::error::active compiler is '$got' but rust-toolchain.toml pins $want"; exit 1 ;;
+        esac
+        echo "- \`$got\` on \`${ImageOS:-?}\` image \`${ImageVersion:-?}\`" >> "$GITHUB_STEP_SUMMARY"

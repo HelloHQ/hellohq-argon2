@@ -1,0 +1,40 @@
+# The exact compiler every build uses: local, CI and release.
+#
+# v0.1.0 was built with rustc 1.99.0 (b940084d7 2026-09-28), installed as the
+# then-floating `stable` on every release runner. Pinning that same release here
+# means the next release changes compiler only by an explicit, reviewed edit to
+# this file, and a rebuild of v0.1.0's source on the pinned release runners
+# uses the compiler that produced the shipped bytes.
+#
+# Pinning rustc is necessary, not sufficient, for byte-identical output: the
+# platform SDK/linker matters too (see README "Reproducibility" and the SDK pin
+# in .github/workflows/release.yml).
+#
+# Bumping: change `channel`, run `cargo test --locked --all-targets`, cut a new
+# release, and pin its new digests in hellohq's native/mlkem/artifacts.lock.
+[toolchain]
+channel = "1.99.0"
+profile = "minimal"
+components = ["rustfmt", "clippy"]
+# Every target a release asset is built for (build-release.sh), so
+# `cargo build --target <t>` works anywhere the toolchain is installed.
+targets = [
+  # macOS universal dylib
+  "aarch64-apple-darwin",
+  "x86_64-apple-darwin",
+  # iOS xcframework (device + simulator)
+  "aarch64-apple-ios",
+  "aarch64-apple-ios-sim",
+  "x86_64-apple-ios",
+  # Linux
+  "x86_64-unknown-linux-gnu",
+  "aarch64-unknown-linux-gnu",
+  # Android jniLibs
+  "aarch64-linux-android",
+  "armv7-linux-androideabi",
+  "x86_64-linux-android",
+  "i686-linux-android",
+  # Windows
+  "x86_64-pc-windows-msvc",
+  "aarch64-pc-windows-msvc",
+]

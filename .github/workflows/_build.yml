@@ -1,0 +1,104 @@
+name: _Build release assets
+
+# Reusable: the one build matrix behind both release.yml (publishes) and
+# reproduce.yml (rebuilds a published tag and compares digests). Keeping it in
+# one place is what makes "reproduce" mean anything: same runners, same pinned
+# compiler and SDK, same build-release.sh.
+#
+# PUBLIC REPOSITORY: every job runs on GitHub-hosted runners, never on the
+# self-hosted pool (a public repo's pull requests must not reach HelloHQ's own
+# machines).
+#
+# Everything that changes the shipped bytes is pinned, and each pin fails
+# closed rather than drifting:
+#   rustc            rust-toolchain.toml (.github/actions/pinned-rust)
+#   Xcode + SDKs     XCODE / MACOS_SDK / IOS_SDK below (.github/actions/pinned-xcode)
+#   MSVC link        /Brepro (build-release.sh): no wall-clock PE timestamp
+#   runners          explicit image labels, never *-latest
+#   Android NDK      ANDROID_NDK_VERSION below (must exist on the image)
+#   crates           Cargo.lock (--locked; crates.io checksums)
+# What is NOT pinned: the image contents behind each label beyond the above
+# (binutils/glibc on Linux, the MSVC linker on Windows).
+
+on:
+  workflow_call:
+    inputs:
+      source-ref:
+        description: Commit or tag whose source is built.
+        required: true
+        type: string
+      pins-ref:
+        description: >-
+          Commit whose rust-toolchain.toml and .github/actions are used. Equal
+          to source-ref for a release; the current main for reproducing a tag
+          that predates a pin change.
+        required: true
+        type: string
+
+env:
+  XCODE: "26.6"
+  MACOS_SDK: "26.5"
+  IOS_SDK: "26.5"
+  ANDROID_NDK_VERSION: "28.2.13676358"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build · ${{ matrix.name }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: macos, runner: macos-26 }
+          - { name: linux-x64, runner: ubuntu-24.04 }
+          - { name: windows, runner: windows-2025 }
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.source-ref }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Overlay the pins (no-op when pins-ref is source-ref)
+        shell: bash
+        run: |
+          set -euo pipefail
+          git checkout "${{ inputs.pins-ref }}" -- rust-toolchain.toml .github/actions
+          git reset -q   # keep the overlay out of the index; SOURCE_DATE_EPOCH stays the source commit's
+          echo "source $(git rev-parse HEAD), pins from ${{ inputs.pins-ref }}"
+
+      - uses: ./.github/actions/pinned-rust
+
+      - uses: ./.github/actions/pinned-xcode
+        if: runner.os == 'macOS'
+        with:
+          xcode: ${{ env.XCODE }}
+          macos-sdk: ${{ env.MACOS_SDK }}
+          ios-sdk: ${{ env.IOS_SDK }}
+
+      # Android jniLibs only on the x64 Linux job (build-release.sh keys off
+      # ANDROID_NDK_HOME; the NDK's clang links each ABI, no cargo-ndk).
+      - name: Set up Android cross-build (pinned NDK)
+        if: matrix.name == 'linux-x64'
+        shell: bash
+        run: |
+          set -euo pipefail
+          ndk="${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}/ndk/$ANDROID_NDK_VERSION"
+          [ -d "$ndk" ] || { echo "::error::NDK $ANDROID_NDK_VERSION not on this image (have: $(ls "$(dirname "$ndk")" | tr '\n' ' ')). Move the pin deliberately; it changes jniLibs.zip."; exit 1; }
+          echo "ANDROID_NDK_HOME=$ndk" >> "$GITHUB_ENV"
+          echo "ANDROID_NDK_ROOT=$ndk" >> "$GITHUB_ENV"
+          echo "- Android NDK $ANDROID_NDK_VERSION" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Build native libs
+        shell: bash
+        run: bash build-release.sh "${{ runner.temp }}/dist"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: dist-${{ matrix.name }}
+          path: ${{ runner.temp }}/dist/*
+          if-no-files-found: error
+          retention-days: 3
